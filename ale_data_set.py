@@ -96,25 +96,29 @@ batch_size randomly chosen state transitions.
 
         """
         # Allocate the response.
+        sequence_length = self.phi_length + 2*self.K + 2
         imgs = np.zeros((batch_size,
-                         self.phi_length + 1 + 2*self.K + 1,
+                         sequence_length,
                          self.height,
                          self.width),
                         dtype='uint8')
-        actions = np.zeros((batch_size, 1), dtype='int32')
-        rewards = np.zeros((batch_size, 2*self.K + 2), dtype=floatX)
-        terminal = np.zeros((batch_size, self.phi_length + 1 + 2*self.K + 1), dtype='bool')
+        actions = np.zeros((batch_size, sequence_length), dtype='int32')
+        rewards = np.zeros((batch_size, sequence_length), dtype=floatX)
+        terminal = np.zeros((batch_size, sequence_length), dtype='bool')
 
         count = 0
         while count < batch_size:
             # Randomly choose a time step from the replay memory.
-            index = self.rng.randint(self.bottom,
-                                     self.bottom + self.size - self.phi_length)
+            index = self.rng.randint(self.bottom + self.K + 1,
+                                     self.bottom + self.size - self.phi_length - self.K)
 
             # Both the before and after states contain phi_length
             # frames, overlapping except for the first and last.
             end_index = index + self.phi_length - 1
-            all_indices = np.arange(end_index, index + self.phi_length + 1)
+            all_indices = np.arange(end_index-self.K-self.phi_length, end_index+self.K+2)
+            #print index, end_index
+            #print all_indices
+            #print all_indices[self.K+1:-self.K]
             # Check that the initial state corresponds entirely to a
             # single episode, meaning none but its last frame (the
             # second-to-last frame in imgs) may be terminal. If the last
@@ -123,16 +127,20 @@ batch_size randomly chosen state transitions.
             # frame of a new episode, which the Q learner recognizes and
             # handles correctly during training by zeroing the
             # discounted future reward estimate.
-            if np.any(self.terminal.take(all_indices[0:-1], mode='wrap')):
+            if np.any(self.terminal.take(all_indices[self.K:-self.K], mode='wrap')):
                 continue
 
             # Add the state transition to the response.
             imgs[count] = self.imgs.take(all_indices, axis=0, mode='wrap')
-            actions[count] = self.actions.take(end_index, mode='wrap')
-            rewards[count] = self.rewards.take(end_index, mode='wrap')
-            terminal[count] = self.terminal.take(end_index, mode='wrap')
+            actions[count] = self.actions.take(all_indices, mode='wrap')
+            rewards[count] = self.rewards.take(all_indices, mode='wrap')
+            terminal[count] = self.terminal.take(all_indices, mode='wrap')
             count += 1
 
+            #print imgs.shape, actions.shape
+
+            #import os
+            #os.sys.exit(0)
         return imgs, actions, rewards, terminal
 
 

@@ -32,14 +32,16 @@ class DeepQLearner:
                  num_frames, discount, learning_rate, rho,
                  rms_epsilon, momentum, clip_delta, freeze_interval,
                  batch_size, network_type, update_rule,
-                 batch_accumulator, rng, input_scale=255.0, ctx=mx.gpu(0)):
+                 batch_accumulator, rng, input_scale=255.0, ctx=mx.gpu(0), K=4, lam=4):
 
+        self.lam = lam
         self.input_width = input_width
         self.input_height = input_height
         self.num_actions = num_actions
         self.num_frames = num_frames
         self.batch_size = batch_size
         self.discount = discount
+        self.K = K
         self.rho = rho
         self.lr = learning_rate
         self.rms_epsilon = rms_epsilon
@@ -115,32 +117,87 @@ class DeepQLearner:
 
         Returns: average loss
         """
-        states = imgs[:, :-1, :, :]
-        next_states = imgs[:, 1:, :, :]
-
-
+        index = self.K + self.num_frames
+        states = imgs[:, index-3:index+1, :, :]
+        next_states = imgs[:, index-2:index+2:, :, :]
 
         st = mx.nd.array(states, ctx=self.ctx) / self.input_scale
-        at = mx.nd.array(actions[:, 0], ctx=self.ctx)
-        rt = mx.nd.array(rewards[:, 0], ctx=self.ctx)
-        tt = mx.nd.array(terminals[:, 0], ctx=self.ctx)
+        at = mx.nd.array(actions[:, index], ctx=self.ctx)
+        rt = mx.nd.array(rewards[:, index], ctx=self.ctx)
+        tt = mx.nd.array(terminals[:, index], ctx=self.ctx)
         st1 = mx.nd.array(next_states, ctx=self.ctx) / self.input_scale
 
-
         next_q_out = self.target_exe.forward(data=st1)[0]
-        target_q_values = rt + mx.nd.choose_element_0index(next_q_out, mx.nd.argmax_channel(next_q_out)) * (1.0 - tt) * self.discount
+        target_q_values = rt + mx.nd.choose_element_0index(next_q_out,
+                mx.nd.argmax_channel(next_q_out)) * (1.0 - tt) * self.discount
 
         current_q_out = self.loss_exe.forward(is_train=True, data=st)[0]
         current_q_values = mx.nd.choose_element_0index(current_q_out, at)
 
-        diff = mx.nd.clip(current_q_values-target_q_values, -1.0, 1.0)
+        Q_matrix = np.zeros((self.batch_size, self.K*2+3))
+        for k in range(0, self.K+1):
+            st_ = mx.nd.array(imgs[:, k:k+self.num_frames], ctx=self.ctx) / self.input_scale
+            at_ = mx.nd.array(actions[:, k+self.num_frames-1], ctx=self.ctx)
+            q_out_ = self.target_exe.forward(data=st_)[0]
+            Q = mx.nd.choose_element_0index(q_out_, at_)
+            Q_matrix[:, k] = Q.asnumpy()
+
+        for k in range(self.K+2, self.K*2+3):
+            st_ = mx.nd.array(imgs[:, k:k+self.num_frames], ctx=self.ctx) / self.input_scale
+            q_out_ = self.target_exe.forward(data=st_)[0]
+            Q = mx.nd.max_axis(q_out_, axis=1)
+            Q_matrix[:, k] = Q.asnumpy()
+
+        Q_matrix[:, self.K+1] = target_q_values.asnumpy()
+
+        L = np.zeros(self.batch_size)
+        U = np.zeros(self.batch_size)
+
+        for b in range(self.batch_size):
+            index = self.num_frames + self.K
+
+            R = 0
+            Ls = [Q_matrix[b, self.K+1]]
+            for k in range(1, self.K+1):
+                if terminals[b, index+k]:
+                    break
+                R += self.discount**k * rewards[b, index+k]
+                L_ = R + self.discount ** (k+1) * Q_matrix[b, self.K+2+k]
+                Ls.append(L_)
+            L[b] = max(Ls)
+
+            Us = []
+            R = 0
+            for k in range(0, self.K+1):
+                if terminals[b, index-k-self.num_frames+1]:
+                    break
+                R -= rewards[b, index-1-k] / self.discount ** (1+k)
+                U_ = Q_matrix[b, self.K-k] / self.discount ** (1+k) + R
+                Us.append(U_)
+            U[b] = min(Us)
+
+        L = mx.nd.array(L, ctx=self.ctx)
+        U = mx.nd.array(U, ctx=self.ctx)
+
+        grad_L = -self.lam * mx.nd.maximum(L - current_q_values, 0)
+        grad_U = self.lam * mx.nd.maximum(current_q_values - U, 0)
+
+
+
+
+
+
+
+        #diff = mx.nd.clip(current_q_values-target_q_values, -1.0, 1.0)
+        diff = mx.nd.clip(current_q_values-target_q_values, -1.0, 1.0)  + grad_U + grad_L
         out_grad = mx.nd.zeros((self.batch_size, self.num_actions), ctx=self.ctx)
         out_grad = mx.nd.fill_element_0index(out_grad, diff, at)
 
         self.loss_exe.backward(out_grad)
         self.update_weights(self.loss_exe, self.updater)
 
-        if self.freeze_interval > 0 and self.update_counter > 0 and self.update_counter % self.freeze_interval == 0:
+        if self.freeze_interval > 0 and self.update_counter > 0 and \
+                self.update_counter % self.freeze_interval == 0:
             self.target_exe.copy_params_from(arg_params=self.loss_exe.arg_dict)
 
         self.update_counter += 1
